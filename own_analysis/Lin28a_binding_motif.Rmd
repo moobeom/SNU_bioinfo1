@@ -1,0 +1,159 @@
+---
+title: "Lin28a_binding_motif"
+author: "mbhong"
+date: '2024 6 13 '
+output:
+  html_document:
+    df_print: paged
+---
+
+
+## 2.1 Generate a pileup file to find high error-rate areas at a whole genome-wide level
+```{bash}
+
+samtools mpileup CLIP-35L33G.bam > CLIP-35L33G.pileup
+gunzip CLIP-35L33G.pileup.gz
+```
+
+
+## 2.2 Data QC (preprocessing)
+```{r}
+
+load("~/binfo1_work/CLIP-35L33G.pileup")
+
+# filter 1: read depth > 50
+tmp1 = pileup[pileup$count > 50,]
+
+# filter 2: chrID (only starts with "chr")
+tmp2 = tmp1[grepl("^chr",tmp1[,"chr"]),]
+
+# filter 3: remove sequencing tags and indels
+clean_basereads = gsub("[[:punct:]]", "", data$clean_basereads)   # remove tags
+clean_basereads = gsub("[-0-9nNID]", "", clean_basereads)  # remove indels
+tmp3 = data.frame(data[,c("chr","pos")], clean_basereads, stringsAsFactors=FALSE)
+
+# filter 4: split (+) & (-) stranded-pileups
+p_basereads = gsub("[acgt]", "", tmp3$clean_basereads)
+m_basereads = gsub("[ACGT]", "", tmp3$clean_basereads)
+tmp4p = data.frame(data[,c("chr","pos")], p_basereads, stringsAsFactors=FALSE)
+tmp4m = data.frame(data[,c("chr","pos")], m_basereads, stringsAsFactors=FALSE)
+
+# filter 5: remove empty basereads
+tmp5p = tmp4p[!(tmp4p$p_basereads == ""),]
+tmp5m = tmp4m[!(tmp4m$m_basereads == ""),]
+
+fwrite(tmp5p,"~/binfo1_work/CLIP-35L33G_filtered_plus.pileup",col.names = TRUE, quote = FALSE, sep="\t")
+fwrite(tmp5m,"~/binfo1_work/CLIP-35L33G_filtered_minus.pileup",col.names = TRUE, quote = FALSE, sep="\t")
+```
+
+
+## 2.3 Filter "Entropy > 0.8" & "read depth > 50" to find high-error rate areas, which can be a candidate of most-frequently cross-linked site
+```{r}
+
+calc_entropy = function(text){
+  valid_base = c("A", "a", "T", "t", "G", "g", "C", "c")
+  text = strsplit(text, "")[[1]]
+  text = text[text %in% valid_base]
+  base = unique(text)
+  
+  entropy = 0
+  for (n in base){
+    p = sum(text==n)/length(text)
+    entropy = entropy - p*log2(p)
+  }
+  entropy
+}
+
+calc_depth = function(text){
+  text = strsplit(text, "")[[1]]
+  length(text)
+}
+```
+
+```{r}
+library(data.table)
+library(dplyr)
+p_pileup= fread("~/binfo1_work/CLIP-35L33G_filtered_plus.pileup", sep="\t", header=TRUE, stringsAsFactors=FALSE) %>% as.data.frame()
+m_pileup= fread("~/binfo1_work/CLIP-35L33G_filtered_minus.pileup", sep="\t", header=TRUE, stringsAsFactors=FALSE) %>% as.data.frame()
+
+p_pileup = p_pileup %>% rowwise() %>% mutate(entropy=calc_entropy(p_basereads))
+p_pileup = p_pileup %>% rowwise() %>% mutate(depth=calc_depth(p_basereads))
+tmp = p_pileup %>% filter(entropy > 0.8 & depth > 50)
+tmp$strand = "p"
+
+m_pileup = m_pileup %>% rowwise() %>% mutate(entropy=calc_entropy(m_basereads))
+m_pileup = m_pileup %>% rowwise() %>% mutate(depth=calc_depth(m_basereads))
+tmp2 = m_pileup %>% filter(entropy > 0.8 & depth > 50)
+tmp2$strand = "m"
+
+fwrite(tmp,"~/binfo1_work/plus_binding_site.pileup",col.names = TRUE, quote = FALSE, sep="\t")
+fwrite(tmp2,"~/binfo1_work/minus_binding_site.pileup",col.names = TRUE, quote = FALSE, sep="\t")
+```
+
+
+## 2.4 Find the binding motif corresponding to the high-error rate areas from the UCSC reference genome
+```{r}
+system(paste("cd", "~/binfo1_work/"))
+system(paste("wget", "https://hgdownload.soe.ucsc.edu/goldenPath/mm39/chromosomes/chr*.fa.gz"))
+system(paste("gunzip", "~/binfo1_work/ref/*.fa.gz"))
+```
+
+```{r}
+
+library(data.table)
+library(dplyr)
+library(stringi)
+library(parallel)
+library(doParallel)
+
+
+# find motifs from the reference genome split by chromosomes
+num_cores <- 19
+chromosomes <- 1:19
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+mclapply(chromosomes, function(chr){
+  ref = fread(paste0("~/binfo1_work/ref/chr",chr,".fa"))
+  ref = paste0(ref[,1] %>% pull, collapse = "")
+  
+  binding_site = fread("~/binfo1_work/plus_binding_site.pileup", sep="\t", header=TRUE, stringsAsFactors=FALSE) %>% as.data.frame()
+  binding_site_chr = binding_site[which(binding_site$chr == paste0("chr",chr)),]
+  binding_site_chr$ref = stri_sub(ref, binding_site_chr$pos, binding_site_chr$pos)
+  if (binding_site_chr$strand == 'p'){
+    binding_site_chr$motif = ifelse(binding_site_chr$ref == toupper(binding_site_chr$ref), 
+                                  stri_sub(ref, binding_site_chr$pos-10, binding_site_chr$pos+10),
+                                  toupper(stri_sub(ref, binding_site_chr$pos-10, binding_site_chr$pos+10)))
+  }else{
+    binding_site_chr$motif = ifelse(binding_site_chr$ref == toupper(binding_site_chr$ref), 
+                                chartr("ACGTN", "TGCAN", stri_reverse(stri_sub(ref, binding_site_chr$pos-10, binding_site_chr$pos+10))),
+                                chartr("ACGTN", "TGCAN", stri_reverse(toupper(stri_sub(ref, binding_site_chr$pos-10,
+                                                                                       binding_site_chr$pos+10)))))
+  }
+  fwrite(binding_site_chr, paste0("~/binfo1_work/motif/Lin28a_binding_motif_chr",chr),col.names = TRUE, quote = FALSE, sep="\t")
+}
+, mc.cores = num_cores)
+stopCluster(cl)
+```
+
+```{r}
+
+# merge chromosome-split files
+library(gtools)
+file_path = paste0("~/binfo1_work/motif/")
+file_list = mixedsort(list.files(file_path))
+merged_data = data.frame()
+
+for (file in file_list) {
+  tmp = fread(paste0(file_path, file), header = TRUE, sep="\t", stringsAsFactors=FALSE)
+  merged_data = rbind(merged_data, tmp)
+}
+
+fwrite(merged_data, paste0("~/binfo1_work/Lin28a_binding_motif"), col.names = TRUE, quote = FALSE, sep="\t")
+head(merged_data)
+
+
+# extract motifs to visualize via WebLogo
+motifs = gsub("T","U",merged_data$motif)
+fwrite(list(motifs), paste0("~/binfo1_work/motif_minus.txt"), col.names = FALSE, quote = FALSE, sep="\n")
+```
